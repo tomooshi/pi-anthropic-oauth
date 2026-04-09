@@ -139,6 +139,39 @@ export function convertPiMessagesToAnthropic(
     }
   }
 
+  // ── Validate: ensure every tool_use has a matching tool_result ──
+  // If a tool_use block exists without a corresponding tool_result,
+  // the Anthropic API will reject the request with a 400 error.
+  // This can happen if the framework fails to record a tool_result
+  // when an extension blocks a tool_call.
+  const pendingToolUseIds = new Set<string>();
+  for (const param of params) {
+    if (param.role === "assistant" && Array.isArray(param.content)) {
+      for (const block of param.content) {
+        if ((block as { type: string }).type === "tool_use") {
+          pendingToolUseIds.add((block as { id: string }).id);
+        }
+      }
+    } else if (param.role === "user" && Array.isArray(param.content)) {
+      for (const block of param.content) {
+        if ((block as { type: string }).type === "tool_result") {
+          pendingToolUseIds.delete((block as { tool_use_id: string }).tool_use_id);
+        }
+      }
+    }
+  }
+
+  // Patch orphaned tool_use blocks with synthetic tool_results
+  if (pendingToolUseIds.size > 0) {
+    const syntheticResults = [...pendingToolUseIds].map((id) => ({
+      type: "tool_result" as const,
+      tool_use_id: id,
+      content: "[Error: tool result was not recorded — this is a framework bug]",
+      is_error: true,
+    }));
+    params.push({ role: "user", content: syntheticResults });
+  }
+
   const last = params.at(-1);
   if (last?.role === "user" && Array.isArray(last.content) && last.content.length > 0) {
     const lastBlock = last.content[last.content.length - 1] as { cache_control?: { type: string } };
