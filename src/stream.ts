@@ -111,10 +111,13 @@ export function streamAnthropicOAuth(
         dangerouslyAllowBrowser: true,
       });
 
+      const maxTokens =
+        options?.maxTokens || Math.floor(model.maxTokens / 3);
+
       const params: MessageCreateParamsStreaming = {
         model: model.id,
         messages: convertPiMessagesToAnthropic(context.messages, isOAuth),
-        max_tokens: options?.maxTokens || Math.floor(model.maxTokens / 3),
+        max_tokens: maxTokens,
         stream: true,
       };
 
@@ -123,7 +126,7 @@ export function streamAnthropicOAuth(
       if (context.tools?.length)
         params.tools = convertPiToolsToAnthropic(context.tools, isOAuth);
 
-      if (options?.reasoning && model.reasoning) {
+      if (options?.reasoning && model.reasoning && maxTokens > 1) {
         const defaultBudgets: Record<string, number> = {
           minimal: 1024,
           low: 4096,
@@ -135,10 +138,12 @@ export function streamAnthropicOAuth(
           options.thinkingBudgets?.[
             options.reasoning as keyof typeof options.thinkingBudgets
           ];
+        const requestedBudget =
+          customBudget ?? defaultBudgets[options.reasoning] ?? 10240;
+
         params.thinking = {
           type: "enabled",
-          budget_tokens:
-            customBudget ?? defaultBudgets[options.reasoning] ?? 10240,
+          budget_tokens: Math.min(requestedBudget, maxTokens - 1),
         };
       }
 
