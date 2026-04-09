@@ -140,37 +140,67 @@ export function convertPiMessagesToAnthropic(
   }
 
   // ── Validate: ensure every tool_use has a matching tool_result ──
-  // If a tool_use block exists without a corresponding tool_result,
-  // the Anthropic API will reject the request with a 400 error.
-  // This can happen if the framework fails to record a tool_result
-  // when an extension blocks a tool_call.
-  const pendingToolUseIds = new Set<string>();
-  for (const param of params) {
+  // The Anthropic API requires tool_result blocks IMMEDIATELY after
+  // the assistant message containing tool_use blocks. If any are
+  // missing (e.g., due to abort or framework bug), inject synthetic
+  // tool_results in the correct position to prevent 400 errors.
+  const repaired: MessageParam[] = [];
+  for (let k = 0; k < params.length; k++) {
+    const param = params[k];
+    repaired.push(param);
+
+    // After each assistant message, check if all tool_use blocks have results
     if (param.role === "assistant" && Array.isArray(param.content)) {
+      const toolUseIds: string[] = [];
       for (const block of param.content) {
         if ((block as { type: string }).type === "tool_use") {
-          pendingToolUseIds.add((block as { id: string }).id);
+          toolUseIds.push((block as { id: string }).id);
         }
       }
-    } else if (param.role === "user" && Array.isArray(param.content)) {
-      for (const block of param.content) {
-        if ((block as { type: string }).type === "tool_result") {
-          pendingToolUseIds.delete((block as { tool_use_id: string }).tool_use_id);
+
+      if (toolUseIds.length > 0) {
+        // Collect tool_result ids from the next user message(s)
+        const resolvedIds = new Set<string>();
+        let peek = k + 1;
+        while (peek < params.length && params[peek].role === "user") {
+          const userParam = params[peek];
+          if (Array.isArray(userParam.content)) {
+            for (const block of userParam.content) {
+              if ((block as { type: string }).type === "tool_result") {
+                resolvedIds.add((block as { tool_use_id: string }).tool_use_id);
+              }
+            }
+          }
+          peek++;
+        }
+
+        // Find orphaned tool_use ids
+        const orphaned = toolUseIds.filter((id) => !resolvedIds.has(id));
+        if (orphaned.length > 0) {
+          // Check if the next message is already a user message we can append to
+          const next = params[k + 1];
+          const syntheticResults = orphaned.map((id) => ({
+            type: "tool_result" as const,
+            tool_use_id: id,
+            content: "[Error: tool execution was aborted or result was not recorded]",
+            is_error: true,
+          }));
+
+          if (next?.role === "user" && Array.isArray(next.content)) {
+            // Prepend synthetic results into the existing user message
+            (next.content as unknown[]).unshift(...syntheticResults);
+          } else {
+            // Insert a new user message with the synthetic results right after assistant
+            repaired.push({ role: "user", content: syntheticResults });
+          }
         }
       }
     }
   }
 
-  // Patch orphaned tool_use blocks with synthetic tool_results
-  if (pendingToolUseIds.size > 0) {
-    const syntheticResults = [...pendingToolUseIds].map((id) => ({
-      type: "tool_result" as const,
-      tool_use_id: id,
-      content: "[Error: tool result was not recorded — this is a framework bug]",
-      is_error: true,
-    }));
-    params.push({ role: "user", content: syntheticResults });
-  }
+  // Replace params with repaired version
+  params.length = 0;
+  params.push(...repaired);
 
   const last = params.at(-1);
   if (last?.role === "user" && Array.isArray(last.content) && last.content.length > 0) {
